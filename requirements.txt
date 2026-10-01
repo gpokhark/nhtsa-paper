@@ -1,0 +1,15 @@
+# NHTSA Complaint Defect Detection Pipeline
+# LLM-powered extraction, clustering, and gap analysis
+
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+sentence-transformers>=2.2
+openai>=1.0
+pydantic>=2.0
+tqdm>=4.65
+matplotlib>=3.7
+seaborn>=0.12
+plotly>=5.15
+requests>=2.31
+joblib>=1.3
