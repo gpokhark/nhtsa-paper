@@ -1112,3 +1112,12 @@ __pycache__/
 # Claude Code session-runtime artifacts, not project content.
 .claude/*.lock
 
+
+### NHTSA local data/artifacts ###
+/data/
+/results/
+*.parquet
+*.feather
+*.arrow
+*.zip
+*.lst

@@ -1,307 +1,388 @@
 """
-Data download and preprocessing for NHTSA complaint data.
+Data download and preprocessing for official NHTSA flat-file datasets.
 
-Handles:
-- Downloading complaint ZIP files from NHTSA
-- Parsing CSV files (with known encoding issues)
-- Deduplication and filtering
-- Export to Parquet for efficient downstream processing
+The north-star implementation uses NHTSA's official ODI flat files rather
+than legacy CSV-style complaint downloads:
+- complaints: https://static.nhtsa.gov/odi/ffdd/cmpl/
+- recalls:    https://static.nhtsa.gov/odi/ffdd/rcl/
+
+Complaint records are tab-delimited TXT files inside ZIP archives. The parser
+keeps the original ODI identifiers (`CMPLID`, `ODINO`) and adds friendly column
+aliases used by the rest of this prototype.
 """
 
 from __future__ import annotations
 
 import csv
-import io
 import logging
-import os
-import re
 import zipfile
 from pathlib import Path
-from typing import Iterator
 
 import pandas as pd
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-# NHTSA complaint data download URLs
+NHTSA_STATIC_BASE = "https://static.nhtsa.gov/odi/ffdd"
+
+# Official NHTSA complaint bulk files, split by received-date blocks.
 COMPLAINT_URLS = {
-    "1995-1999": "https://www.nhtsa.gov/downloads/folders/Complaints/COMPLAINTS_RECEIVED_1995-1999.zip",
-    "2000-2004": "https://www.nhtsa.gov/downloads/folders/Complaints/COMPLAINTS_RECEIVED_2000-2004.zip",
-    "2005-2009": "https://www.nhtsa.gov/downloads/folders/Complaints/COMPLAINTS_RECEIVED_2005-2009.zip",
-    "2010-2014": "https://www.nhtsa.gov/downloads/folders/Complaints/COMPLAINTS_RECEIVED_2010-2014.zip",
-    "2015-2019": "https://www.nhtsa.gov/downloads/folders/Complaints/COMPLAINTS_RECEIVED_2015-2019.zip",
-    "2020-2024": "https://www.nhtsa.gov/downloads/folders/Complaints/COMPLAINTS_RECEIVED_2020-2024.zip",
-    "2025-2026": "https://www.nhtsa.gov/downloads/folders/Complaints/COMPLAINTS_RECEIVED_2025-2026.zip",
+    "1995-1999": f"{NHTSA_STATIC_BASE}/cmpl/COMPLAINTS_RECEIVED_1995-1999.zip",
+    "2000-2004": f"{NHTSA_STATIC_BASE}/cmpl/COMPLAINTS_RECEIVED_2000-2004.zip",
+    "2005-2009": f"{NHTSA_STATIC_BASE}/cmpl/COMPLAINTS_RECEIVED_2005-2009.zip",
+    "2010-2014": f"{NHTSA_STATIC_BASE}/cmpl/COMPLAINTS_RECEIVED_2010-2014.zip",
+    "2015-2019": f"{NHTSA_STATIC_BASE}/cmpl/COMPLAINTS_RECEIVED_2015-2019.zip",
+    "2020-2024": f"{NHTSA_STATIC_BASE}/cmpl/COMPLAINTS_RECEIVED_2020-2024.zip",
+    "2025-2026": f"{NHTSA_STATIC_BASE}/cmpl/COMPLAINTS_RECEIVED_2025-2026.zip",
 }
 
-# Expected CSV columns (may vary slightly by year block)
-EXPECTED_COLUMNS = [
-    "Complaint ID",
-    "Date Received",
-    "Make",
-    "Model",
-    "Model Year",
-    "Purchase Date",
-    "Mileage",
-    "Failure Date",
-    "Failure Mileage",
-    "Component",
-    "Defect Characteristic",
-    "Narrative",
-    "Owner City",
-    "Owner State",
-    "PMI",
+RECALL_URLS = {
+    "post-2010": f"{NHTSA_STATIC_BASE}/rcl/FLAT_RCL_POST_2010.zip",
+    "pre-2010": f"{NHTSA_STATIC_BASE}/rcl/FLAT_RCL_PRE_2010.zip",
+    "all": f"{NHTSA_STATIC_BASE}/rcl/FLAT_RCL.zip",
+}
+
+COMPLAINT_FIELDS = [
+    "CMPLID", "ODINO", "MFR_NAME", "MAKETXT", "MODELTXT", "YEARTXT",
+    "CRASH", "FAILDATE", "FIRE", "INJURED", "DEATHS", "COMPDESC",
+    "CITY", "STATE", "VIN", "DATEA", "LDATE", "MILES", "OCCURENCES",
+    "CDESCR", "CMPL_TYPE", "POLICE_RPT_YN", "PURCH_DT", "ORIG_OWNER_YN",
+    "ANTI_BRAKES_YN", "CRUISE_CONT_YN", "NUM_CYLS", "DRIVE_TRAIN",
+    "FUEL_SYS", "FUEL_TYPE", "TRANS_TYPE", "VEH_SPEED", "DOT",
+    "TIRE_SIZE", "LOC_OF_TIRE", "TIRE_FAIL_TYPE", "ORIG_EQUIP_YN",
+    "MANUF_DT", "SEAT_TYPE", "RESTRAINT_TYPE", "DEALER_NAME",
+    "DEALER_TEL", "DEALER_CITY", "DEALER_STATE", "DEALER_ZIP",
+    "PROD_TYPE", "REPAIRED_YN", "MEDICAL_ATTN", "VEHICLES_TOWED_YN",
+    "STATE_OF_INCIDENT", "VEHICLE_OPERATOR",
 ]
 
+RECALL_FIELDS = [
+    "RECORD_ID", "CAMPNO", "MAKETXT", "MODELTXT", "YEARTXT", "MFGCAMPNO",
+    "COMPNAME", "MFGNAME", "BGMAN", "ENDMAN", "RCLTYPECD", "POTAFF",
+    "ODATE", "INFLUENCED_BY", "MFGTXT", "RCDATE", "DATEA", "RPNO",
+    "FMVSS", "DESC_DEFECT", "CONEQUENCE_DEFECT", "CORRECTIVE_ACTION",
+    "NOTES", "RCL_CMPT_ID", "MFR_COMP_NAME", "MFR_COMP_DESC",
+    "MFR_COMP_PTNO", "DO_NOT_DRIVE", "PARK_OUTSIDE",
+]
 
-def download_complaints(out_dir: str | Path, year_range: str | None = None) -> list[Path]:
-    """Download complaint ZIP files from NHTSA.
+COMPLAINT_RENAME = {
+    "CMPLID": "Complaint ID",
+    "ODINO": "ODI Number",
+    "MAKETXT": "Make",
+    "MODELTXT": "Model",
+    "YEARTXT": "Model Year",
+    "LDATE": "Date Received",
+    "FAILDATE": "Failure Date",
+    "MILES": "Mileage",
+    "COMPDESC": "Component",
+    "CDESCR": "Narrative",
+}
 
-    Args:
-        out_dir: Output directory for downloaded files
-        year_range: Specific year range to download (e.g., "2020-2024").
-                   If None, downloads all available ranges.
+RECALL_RENAME = {
+    "CAMPNO": "Recall Number",
+    "MAKETXT": "Make",
+    "MODELTXT": "Model",
+    "YEARTXT": "Model Year",
+    "COMPNAME": "Component",
+    "DESC_DEFECT": "Defect Summary",
+    "CONEQUENCE_DEFECT": "Consequence Summary",
+    "CORRECTIVE_ACTION": "Corrective Action",
+    "RCDATE": "Reported Date",
+    "POTAFF": "Potential Units Affected",
+}
 
-    Returns:
-        List of downloaded file paths
-    """
+
+def _download_urls(urls: dict[str, str], out_dir: str | Path, prefix: str, selected: str | None = None) -> list[Path]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if year_range:
-        urls = {year_range: COMPLAINT_URLS[year_range]}
-    else:
-        urls = COMPLAINT_URLS
+    if selected:
+        if selected not in urls:
+            raise KeyError(f"Unknown {prefix} selection {selected!r}; expected one of {sorted(urls)}")
+        urls = {selected: urls[selected]}
 
-    downloaded = []
-    for yr, url in tqdm(urls.items(), desc="Downloading complaints"):
-        dest = out_dir / f"COMPLAINTS_{yr}.zip"
+    downloaded: list[Path] = []
+    for key, url in tqdm(urls.items(), desc=f"Downloading {prefix}"):
+        dest = out_dir / f"{prefix}_{key}.zip"
         if dest.exists():
-            logger.info(f"Already exists: {dest}")
+            logger.info("Already exists: %s", dest)
             downloaded.append(dest)
             continue
 
-        try:
-            import requests
-            resp = requests.get(url, timeout=300, stream=True)
-            resp.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            downloaded.append(dest)
-            logger.info(f"Downloaded: {dest} ({dest.stat().st_size / 1e6:.1f} MB)")
-        except Exception as e:
-            logger.warning(f"Failed to download {url}: {e}")
-
+        from urllib.request import urlopen
+        with urlopen(url, timeout=300) as resp, open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        downloaded.append(dest)
+        logger.info("Downloaded %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
     return downloaded
 
 
-def parse_complaint_csv(zip_path: Path) -> pd.DataFrame:
-    """Parse a NHTSA complaint ZIP file into a DataFrame.
+def download_complaints(out_dir: str | Path, year_range: str | None = None) -> list[Path]:
+    """Download official NHTSA complaint ZIP files.
 
-    NHTSA complaint CSVs have quirks:
-    - Encoded in Windows-1252 or Latin-1 (not UTF-8)
-    - Some fields contain embedded newlines
-    - Narrative field is the richest source of information
-    - Complaint ID is the unique identifier
-
-    Args:
-        zip_path: Path to the ZIP file
-
-    Returns:
-        DataFrame with standardized columns
+    For the 2018 pilot, use `year_range="2015-2019"` and filter to
+    `--received-year 2018` during preprocessing.
     """
-    logger.info(f"Parsing {zip_path.name}...")
+    return _download_urls(COMPLAINT_URLS, out_dir, "COMPLAINTS", selected=year_range)
 
+
+def download_recalls(out_dir: str | Path, recall_range: str = "post-2010") -> list[Path]:
+    """Download official NHTSA recall ZIP files."""
+    return _download_urls(RECALL_URLS, out_dir, "RECALLS", selected=recall_range)
+
+
+def _read_zip_flat_file(zip_path: str | Path, field_names: list[str]) -> pd.DataFrame:
+    zip_path = Path(zip_path)
+    logger.info("Parsing %s", zip_path.name)
     with zipfile.ZipFile(zip_path) as zf:
-        # Find the CSV file in the ZIP
-        csv_files = [f for f in zf.namelist() if f.endswith(".csv")]
-        if not csv_files:
-            raise ValueError(f"No CSV file found in {zip_path}")
-
-        csv_name = csv_files[0]
-        logger.info(f"Found CSV: {csv_name}")
-
-        # Try multiple encodings
-        for encoding in ["windows-1252", "latin-1", "utf-8"]:
-            try:
-                with zf.open(csv_name) as f:
-                    raw = f.read().decode(encoding)
-
-                # Parse CSV with proper quoting
-                reader = csv.DictReader(io.StringIO(raw))
-                rows = list(reader)
-                logger.info(f"  Parsed {len(rows)} rows with encoding={encoding}")
-                break
-            except (UnicodeDecodeError, Exception) as e:
-                if encoding == "utf-8":
-                    raise ValueError(f"Failed to parse {csv_name} with all encodings: {e}")
-                logger.debug(f"  Encoding {encoding} failed: {e}, trying next...")
-                continue
-
-    df = pd.DataFrame(rows)
-
-    # Standardize column names (handle variations)
-    col_map = {}
-    for expected in EXPECTED_COLUMNS:
-        for col in df.columns:
-            if expected.lower() in col.lower() or col.lower() in expected.lower():
-                col_map[col] = expected
-                break
-
-    df = df.rename(columns=col_map)
-
-    # Keep only expected columns that exist
-    keep_cols = [c for c in EXPECTED_COLUMNS if c in df.columns]
-    df = df[keep_cols]
-
-    # Clean narrative: replace newlines with spaces, strip whitespace
-    if "Narrative" in df.columns:
-        df["Narrative"] = df["Narrative"].astype(str).str.replace(r"\n+", " ", regex=True)
-        df["Narrative"] = df["Narrative"].str.strip()
-        # Filter out very short or empty narratives
-        df = df[df["Narrative"].str.len() >= 10]
-
-    # Clean date_received
-    if "Date Received" in df.columns:
-        df["Date Received"] = pd.to_datetime(df["Date Received"], errors="coerce")
-
-    # Clean model_year
-    if "Model Year" in df.columns:
-        df["Model Year"] = pd.to_numeric(df["Model Year"], errors="coerce")
-
-    # Clean mileage
-    if "Mileage" in df.columns:
-        df["Mileage"] = pd.to_numeric(df["Mileage"], errors="coerce")
-
-    # Drop rows with no complaint ID
-    if "Complaint ID" in df.columns:
-        df = df[df["Complaint ID"].notna() & (df["Complaint ID"].astype(str).str.len() > 0)]
-
-    # Deduplicate by complaint ID
-    before = len(df)
-    df = df.drop_duplicates(subset=["Complaint ID"], keep="first")
-    after = len(df)
-    if before != after:
-        logger.info(f"  Deduplicated: {before} -> {after} ({before - after} duplicates removed)")
-
-    # Filter to complaints with narratives
-    if "Narrative" in df.columns:
-        before = len(df)
-        df = df[df["Narrative"].str.len() >= 10]
-        after = len(df)
-        if before != after:
-            logger.info(f"  Filtered narratives: {before} -> {after} ({before - after} removed)")
-
-    logger.info(f"  Final: {len(df)} complaints, {len(df.columns)} columns")
-    logger.info(f"  Columns: {list(df.columns)}")
-
+        flat_files = [name for name in zf.namelist() if name.lower().endswith((".txt", ".lst", ".csv"))]
+        if not flat_files:
+            raise ValueError(f"No flat data file found in {zip_path}")
+        member = flat_files[0]
+        logger.info("Found flat file: %s", member)
+        with zf.open(member) as f:
+            df = pd.read_csv(
+                f,
+                sep="\t",
+                header=None,
+                names=field_names,
+                dtype=str,
+                encoding="latin-1",
+                engine="python",
+                quoting=csv.QUOTE_NONE,
+                on_bad_lines="warn",
+            )
     return df
 
 
-def load_all_complaints(data_dir: str | Path, year_ranges: list[str] | None = None) -> pd.DataFrame:
-    """Load and combine all complaint datasets.
+def _parse_yyyymmdd(series: pd.Series) -> pd.Series:
+    values = series.astype("string").str.strip().replace({"": pd.NA, "0": pd.NA, "00000000": pd.NA})
+    return pd.to_datetime(values, format="%Y%m%d", errors="coerce")
 
-    Args:
-        data_dir: Directory containing complaint ZIP files
-        year_ranges: List of year ranges to load. If None, loads all available.
 
-    Returns:
-        Combined DataFrame with all complaints
-    """
+def standardize_complaints(df: pd.DataFrame, received_year: int | None = None) -> pd.DataFrame:
+    """Add friendly complaint columns while preserving official columns."""
+    df = df.copy()
+    for col in ["LDATE", "FAILDATE", "DATEA", "PURCH_DT", "MANUF_DT"]:
+        if col in df.columns:
+            df[col] = _parse_yyyymmdd(df[col])
+
+    for col in ["YEARTXT", "MILES", "INJURED", "DEATHS", "OCCURENCES", "VEH_SPEED"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if received_year is not None:
+        before = len(df)
+        df = df[df["LDATE"].dt.year == received_year]
+        logger.info("Filtered received year %s: %s -> %s", received_year, before, len(df))
+
+    if "CDESCR" in df.columns:
+        df["CDESCR"] = df["CDESCR"].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+        before = len(df)
+        df = df[df["CDESCR"].str.len() >= 10]
+        logger.info("Filtered short/empty narratives: %s -> %s", before, len(df))
+
+    df = df.rename(columns=COMPLAINT_RENAME)
+    logger.info("Final complaints: %s rows, %s columns", len(df), len(df.columns))
+    return df
+
+
+def parse_complaint_flat_file(zip_path: str | Path, received_year: int | None = None) -> pd.DataFrame:
+    """Parse an official NHTSA complaint ZIP into a standardized DataFrame."""
+    return standardize_complaints(_read_zip_flat_file(zip_path, COMPLAINT_FIELDS), received_year=received_year)
+
+
+def parse_complaint_csv(zip_path: Path) -> pd.DataFrame:
+    """Backward-compatible alias for older code; parses official flat files."""
+    return parse_complaint_flat_file(zip_path)
+
+
+def standardize_recalls(df: pd.DataFrame, reported_year_min: int | None = None) -> pd.DataFrame:
+    """Add friendly recall columns while preserving official fields."""
+    df = df.copy()
+    for col in ["BGMAN", "ENDMAN", "ODATE", "RCDATE", "DATEA"]:
+        if col in df.columns:
+            df[col] = _parse_yyyymmdd(df[col])
+    for col in ["RECORD_ID", "YEARTXT", "POTAFF"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if reported_year_min is not None:
+        before = len(df)
+        df = df[df["RCDATE"].dt.year >= reported_year_min]
+        logger.info("Filtered recalls reported >= %s: %s -> %s", reported_year_min, before, len(df))
+
+    df = df.rename(columns=RECALL_RENAME)
+    logger.info("Final recalls: %s rows, %s columns", len(df), len(df.columns))
+    return df
+
+
+def parse_recall_flat_file(zip_path: str | Path, reported_year_min: int | None = 2010) -> pd.DataFrame:
+    """Parse an official NHTSA recall ZIP into a standardized DataFrame."""
+    return standardize_recalls(_read_zip_flat_file(zip_path, RECALL_FIELDS), reported_year_min=reported_year_min)
+
+
+def load_all_complaints(
+    data_dir: str | Path,
+    year_ranges: list[str] | None = None,
+    received_year: int | None = None,
+) -> pd.DataFrame:
+    """Load and combine downloaded complaint ZIP files."""
     data_dir = Path(data_dir)
     zip_files = sorted(data_dir.glob("COMPLAINTS_*.zip"))
-
     if not zip_files:
         raise FileNotFoundError(f"No complaint ZIP files found in {data_dir}")
-
     if year_ranges:
         zip_files = [f for f in zip_files if any(yr in f.name for yr in year_ranges)]
 
-    dfs = []
-    for zf in zip_files:
-        try:
-            df = parse_complaint_csv(zf)
-            dfs.append(df)
-        except Exception as e:
-            logger.warning(f"Failed to parse {zf}: {e}")
-
-    if not dfs:
-        raise ValueError("No complaint data could be loaded")
-
-    combined = pd.concat(dfs, ignore_index=True)
-    logger.info(f"Combined: {len(combined):,} total complaints across {len(zip_files)} files")
-
+    dfs = [parse_complaint_flat_file(zf, received_year=received_year) for zf in zip_files]
+    combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    logger.info("Combined complaints: %s rows from %s files", len(combined), len(zip_files))
     return combined
 
 
-def export_to_parquet(df: pd.DataFrame, output_path: str | Path) -> None:
-    """Export complaint DataFrame to Parquet for efficient downstream processing.
+def load_all_recalls(data_dir: str | Path, recall_range: str = "post-2010") -> pd.DataFrame:
+    """Load downloaded recall ZIP files."""
+    data_dir = Path(data_dir)
+    zip_files = sorted(data_dir.glob(f"RECALLS_{recall_range}.zip")) or sorted(data_dir.glob("RECALLS_*.zip"))
+    if not zip_files:
+        raise FileNotFoundError(f"No recall ZIP files found in {data_dir}")
+    dfs = [parse_recall_flat_file(zf, reported_year_min=2010 if recall_range == "post-2010" else None) for zf in zip_files]
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-    Args:
-        df: DataFrame to export
-        output_path: Output Parquet file path
-    """
+
+def export_to_parquet(df: pd.DataFrame, output_path: str | Path) -> None:
+    """Export a DataFrame to Parquet for downstream processing."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Ensure consistent dtypes
-    export_df = df.copy()
-
-    # Convert Date Received to ISO format string
-    if "Date Received" in export_df.columns:
-        export_df["Date Received"] = export_df["Date Received"].dt.strftime("%Y-%m-%d")
-
-    # Fill NaN narratives with empty string
-    if "Narrative" in export_df.columns:
-        export_df["Narrative"] = export_df["Narrative"].fillna("")
-
-    export_df.to_parquet(output_path, index=False, engine="pyarrow")
-    logger.info(f"Exported {len(export_df):,} complaints to {output_path}")
+    df.to_parquet(output_path, index=False, engine="pyarrow")
+    logger.info("Exported %s rows to %s", len(df), output_path)
 
 
 def load_from_parquet(path: str | Path) -> pd.DataFrame:
-    """Load complaint data from Parquet.
-
-    Args:
-        path: Path to Parquet file
-
-    Returns:
-        DataFrame
-    """
+    """Load data from Parquet."""
     df = pd.read_parquet(path)
-    logger.info(f"Loaded {len(df):,} complaints from {path}")
+    logger.info("Loaded %s rows from %s", len(df), path)
     return df
 
 
 def get_narrative_stats(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute statistics about complaint narratives.
-
-    Args:
-        df: DataFrame with Narrative column
-
-    Returns:
-        DataFrame with narrative statistics
-    """
-    stats = {
+    """Compute basic complaint narrative statistics."""
+    narrative_col = "Narrative" if "Narrative" in df.columns else "CDESCR"
+    stats: dict[str, object] = {
         "total_complaints": len(df),
-        "with_narrative": df["Narrative"].str.len().gt(0).sum(),
-        "avg_narrative_length": df["Narrative"].str.len().mean(),
-        "median_narrative_length": df["Narrative"].str.len().median(),
-        "min_narrative_length": df["Narrative"].str.len().min(),
-        "max_narrative_length": df["Narrative"].str.len().max(),
-        "short_narratives_lt_50": (df["Narrative"].str.len() < 50).sum(),
-        "medium_narratives_50_200": ((df["Narrative"].str.len() >= 50) & (df["Narrative"].str.len() <= 200)).sum(),
-        "long_narratives_gt_200": (df["Narrative"].str.len() > 200).sum(),
+        "with_narrative": df[narrative_col].fillna("").astype(str).str.len().gt(0).sum(),
+        "avg_narrative_length": df[narrative_col].fillna("").astype(str).str.len().mean(),
+        "median_narrative_length": df[narrative_col].fillna("").astype(str).str.len().median(),
     }
-
-    # Year distribution
     if "Date Received" in df.columns:
         stats["year_distribution"] = df["Date Received"].dt.year.value_counts().sort_index().to_dict()
-
-    # Make distribution (top 20)
     if "Make" in df.columns:
         stats["top_makes"] = df["Make"].value_counts().head(20).to_dict()
-
+    if "Component" in df.columns:
+        stats["top_components"] = df["Component"].value_counts().head(20).to_dict()
     return pd.DataFrame([stats])
+
+
+GOLD_LABEL_COLUMNS = [
+    "gold_component",
+    "gold_failure_mode",
+    "gold_severity_1_5",
+    "gold_safety_outcome",
+    "gold_crash_fire_injury_death",
+    "gold_notes",
+    "reviewer_id",
+]
+
+
+def make_gold_label_sample(
+    df: pd.DataFrame,
+    n: int = 500,
+    random_state: int = 42,
+    min_per_priority_group: int = 25,
+) -> pd.DataFrame:
+    """Create a stratified complaint sample for manual gold-label annotation.
+
+    The sample intentionally over-represents safety-salient records because the
+    first research question is extraction validity for defect triage, not a
+    population estimate. Strata:
+    - any crash/fire/injury/death flag
+    - top NHTSA components by volume
+    - remaining long-tail components
+
+    Returns a CSV-friendly DataFrame with blank `gold_*` columns.
+    """
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if df.empty:
+        raise ValueError("cannot sample from an empty DataFrame")
+
+    work = df.copy()
+    for col in ["CRASH", "FIRE"]:
+        if col not in work.columns:
+            work[col] = "N"
+    for col in ["INJURED", "DEATHS"]:
+        if col not in work.columns:
+            work[col] = 0
+
+    safety_mask = (
+        work["CRASH"].fillna("N").astype(str).str.upper().eq("Y")
+        | work["FIRE"].fillna("N").astype(str).str.upper().eq("Y")
+        | pd.to_numeric(work["INJURED"], errors="coerce").fillna(0).gt(0)
+        | pd.to_numeric(work["DEATHS"], errors="coerce").fillna(0).gt(0)
+    )
+    work["_sample_stratum"] = "long_tail_component"
+    work.loc[safety_mask, "_sample_stratum"] = "safety_flag"
+
+    if "Component" in work.columns:
+        top_components = work.loc[~safety_mask, "Component"].value_counts().head(10).index
+        top_mask = work["Component"].isin(top_components) & ~safety_mask
+        work.loc[top_mask, "_sample_stratum"] = "top_component"
+
+    pieces: list[pd.DataFrame] = []
+    safety_take = min(min_per_priority_group, n // 3, int((work["_sample_stratum"] == "safety_flag").sum()))
+    top_take = min(min_per_priority_group, n // 3, int((work["_sample_stratum"] == "top_component").sum()))
+
+    for stratum, take in [("safety_flag", safety_take), ("top_component", top_take)]:
+        if take > 0:
+            pieces.append(
+                work[work["_sample_stratum"] == stratum].sample(
+                    n=take, random_state=random_state, replace=False
+                )
+            )
+
+    selected = pd.concat(pieces, ignore_index=False) if pieces else work.iloc[0:0]
+    remaining_n = min(n - len(selected), len(work) - len(selected))
+    if remaining_n > 0:
+        remaining = work.drop(index=selected.index, errors="ignore")
+        # Component-stratified fill for broader coverage when possible.
+        if "Component" in remaining.columns and remaining["Component"].nunique() > 1:
+            fill = (
+                remaining.groupby("Component", group_keys=False)
+                .apply(lambda g: g.sample(n=min(len(g), max(1, remaining_n // max(1, remaining["Component"].nunique()))), random_state=random_state))
+                .head(remaining_n)
+            )
+            if len(fill) < remaining_n:
+                extra = remaining.drop(index=fill.index, errors="ignore").sample(
+                    n=remaining_n - len(fill), random_state=random_state, replace=False
+                )
+                fill = pd.concat([fill, extra])
+        else:
+            fill = remaining.sample(n=remaining_n, random_state=random_state, replace=False)
+        selected = pd.concat([selected, fill], ignore_index=False)
+
+    preferred_cols = [
+        "Complaint ID", "ODI Number", "Date Received", "Failure Date", "Make", "Model",
+        "Model Year", "Component", "CRASH", "FIRE", "INJURED", "DEATHS", "Mileage",
+        "Narrative", "_sample_stratum",
+    ]
+    keep_cols = [c for c in preferred_cols if c in selected.columns]
+    sample = selected[keep_cols].copy().sample(frac=1, random_state=random_state).reset_index(drop=True)
+    sample.insert(0, "sample_id", [f"GL{idx + 1:04d}" for idx in range(len(sample))])
+    for col in GOLD_LABEL_COLUMNS:
+        sample[col] = ""
+    return sample

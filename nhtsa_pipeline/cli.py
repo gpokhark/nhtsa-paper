@@ -50,24 +50,13 @@ from pathlib import Path
 
 from nhtsa_pipeline.data import (
     download_complaints,
+    download_recalls,
     load_all_complaints,
+    load_all_recalls,
     load_from_parquet,
     export_to_parquet,
     get_narrative_stats,
-)
-from nhtsa_pipeline.extract import extract_annotations, LLMExtractor
-from nhtsa_pipeline.cluster import (
-    compute_embeddings,
-    cluster_defect_signals,
-    analyze_temporal_patterns,
-    export_clusters,
-    visualize_cluster_distribution,
-)
-from nhtsa_pipeline.gap_analysis import (
-    load_recalls,
-    identify_gaps,
-    export_gaps,
-    visualize_gaps,
+    make_gold_label_sample,
 )
 
 logging.basicConfig(
@@ -79,27 +68,75 @@ logger = logging.getLogger("nhtsa_pipeline")
 
 
 def cmd_download(args: argparse.Namespace) -> None:
-    """Download complaint data from NHTSA."""
-    logger.info("Downloading NHTSA complaint data...")
-    downloaded = download_complaints(args.data_dir, year_range=args.year_range)
-    logger.info(f"Downloaded {len(downloaded)} files: {[f.name for f in downloaded]}")
+    """Download official NHTSA flat-file data."""
+    downloaded = []
+    if args.dataset in {"complaints", "all"}:
+        logger.info("Downloading NHTSA complaint data...")
+        downloaded.extend(download_complaints(args.data_dir, year_range=args.year_range))
+    if args.dataset in {"recalls", "all"}:
+        logger.info("Downloading NHTSA recall data...")
+        downloaded.extend(download_recalls(args.data_dir, recall_range=args.recall_range))
+    logger.info(f"Downloaded/available {len(downloaded)} files: {[f.name for f in downloaded]}")
 
 
 def cmd_preprocess(args: argparse.Namespace) -> None:
-    """Preprocess complaint data into Parquet."""
-    logger.info("Preprocessing complaint data...")
-    df = load_all_complaints(args.data_dir, year_ranges=args.year_ranges)
-
-    # Show stats
-    stats = get_narrative_stats(df)
-    logger.info(f"Narrative stats:\n{stats.to_string()}")
+    """Preprocess downloaded NHTSA flat files into Parquet."""
+    if args.dataset == "complaints":
+        logger.info("Preprocessing complaint data...")
+        df = load_all_complaints(args.data_dir, year_ranges=args.year_ranges, received_year=args.received_year)
+        stats = get_narrative_stats(df)
+        logger.info(f"Narrative stats:\n{stats.to_string()}")
+    elif args.dataset == "recalls":
+        logger.info("Preprocessing recall data...")
+        df = load_all_recalls(args.data_dir, recall_range=args.recall_range)
+    else:
+        raise ValueError(f"Unsupported preprocess dataset: {args.dataset}")
 
     export_to_parquet(df, args.output)
-    logger.info(f"Preprocessed {len(df):,} complaints -> {args.output}")
+    logger.info(f"Preprocessed {len(df):,} {args.dataset} rows -> {args.output}")
+
+
+def cmd_sample(args: argparse.Namespace) -> None:
+    """Create a stratified manual gold-label annotation sample."""
+    logger.info("Loading complaints for gold-label sample...")
+    df = load_from_parquet(args.input)
+    sample = make_gold_label_sample(
+        df,
+        n=args.n,
+        random_state=args.random_state,
+        min_per_priority_group=args.min_per_priority_group,
+    )
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sample.to_csv(output, index=False)
+
+    manifest = {
+        "input": str(args.input),
+        "output": str(output),
+        "sample_size": int(len(sample)),
+        "random_state": args.random_state,
+        "min_per_priority_group": args.min_per_priority_group,
+        "stratum_counts": sample["_sample_stratum"].value_counts().to_dict()
+        if "_sample_stratum" in sample.columns else {},
+        "component_counts_top20": sample["Component"].value_counts().head(20).to_dict()
+        if "Component" in sample.columns else {},
+        "label_columns": [c for c in sample.columns if c.startswith("gold_")] + ["reviewer_id"],
+        "note": "Manual labels are blank by design. Do not treat this CSV as evaluated data until reviewed.",
+    }
+    manifest_path = output.with_suffix(".manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    logger.info("Wrote gold-label sample: %s", output)
+    logger.info("Wrote sample manifest: %s", manifest_path)
+    logger.info("Stratum counts: %s", manifest["stratum_counts"])
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
     """Run LLM-based defect extraction."""
+    from nhtsa_pipeline.extract import extract_annotations
+
     logger.info("Loading complaint data...")
     df = load_from_parquet(args.input)
 
@@ -135,6 +172,14 @@ def cmd_extract(args: argparse.Namespace) -> None:
 
 def cmd_cluster(args: argparse.Namespace) -> None:
     """Run defect signal clustering."""
+    from nhtsa_pipeline.cluster import (
+        compute_embeddings,
+        cluster_defect_signals,
+        analyze_temporal_patterns,
+        export_clusters,
+        visualize_cluster_distribution,
+    )
+
     logger.info("Loading annotations...")
     df = load_from_parquet(args.input)
 
@@ -166,6 +211,13 @@ def cmd_cluster(args: argparse.Namespace) -> None:
 
 def cmd_gaps(args: argparse.Namespace) -> None:
     """Run recall gap analysis."""
+    from nhtsa_pipeline.gap_analysis import (
+        load_recalls,
+        identify_gaps,
+        export_gaps,
+        visualize_gaps,
+    )
+
     logger.info("Loading clusters...")
     with open(args.clusters) as f:
         cluster_data = json.load(f)
@@ -321,15 +373,28 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Download
-    p_download = subparsers.add_parser("download", help="Download complaint data")
+    p_download = subparsers.add_parser("download", help="Download official NHTSA flat-file data")
     p_download.add_argument("--data-dir", default="data/")
-    p_download.add_argument("--year-range", help="Specific year range")
+    p_download.add_argument("--dataset", choices=["complaints", "recalls", "all"], default="complaints")
+    p_download.add_argument("--year-range", help="Complaint year block, e.g. 2015-2019 for the 2018 pilot")
+    p_download.add_argument("--recall-range", choices=["post-2010", "pre-2010", "all"], default="post-2010")
 
     # Preprocess
-    p_preprocess = subparsers.add_parser("preprocess", help="Preprocess complaint data")
+    p_preprocess = subparsers.add_parser("preprocess", help="Preprocess official NHTSA flat files")
     p_preprocess.add_argument("--data-dir", default="data/")
+    p_preprocess.add_argument("--dataset", choices=["complaints", "recalls"], default="complaints")
     p_preprocess.add_argument("--output", default="data/complaints.parquet")
     p_preprocess.add_argument("--year-ranges", nargs="+")
+    p_preprocess.add_argument("--received-year", type=int, help="Filter complaints by NHTSA received year, e.g. 2018")
+    p_preprocess.add_argument("--recall-range", choices=["post-2010", "pre-2010", "all"], default="post-2010")
+
+    # Gold-label sample
+    p_sample = subparsers.add_parser("sample", help="Create stratified CSV for manual gold-label annotation")
+    p_sample.add_argument("--input", default="data/complaints_2018.parquet", help="Input complaints Parquet")
+    p_sample.add_argument("--output", default="data/gold_sample_2018.csv", help="Output annotation CSV")
+    p_sample.add_argument("--n", type=int, default=500, help="Sample size")
+    p_sample.add_argument("--random-state", type=int, default=42)
+    p_sample.add_argument("--min-per-priority-group", type=int, default=25)
 
     # Extract
     p_extract = subparsers.add_parser("extract", help="Extract defect annotations")
@@ -378,6 +443,7 @@ Examples:
     commands = {
         "download": cmd_download,
         "preprocess": cmd_preprocess,
+        "sample": cmd_sample,
         "extract": cmd_extract,
         "cluster": cmd_cluster,
         "gaps": cmd_gaps,
