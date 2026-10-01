@@ -206,7 +206,7 @@ def cmd_cluster(args: argparse.Namespace) -> None:
 
     # Visualize
     if args.visualize:
-        visualize_cluster_distribution(clusters, args.output.with_suffix(".png"))
+        visualize_cluster_distribution(clusters, Path(args.output).with_suffix(".png"))
 
 
 def cmd_gaps(args: argparse.Namespace) -> None:
@@ -267,7 +267,7 @@ def cmd_gaps(args: argparse.Namespace) -> None:
 
     # Visualize
     if args.visualize:
-        visualize_gaps(gaps, args.output.with_suffix(".png"))
+        visualize_gaps(gaps, Path(args.output).with_suffix(".png"))
 
     # Print summary
     priority_counts = {}

@@ -1,196 +1,178 @@
-# Research Paper Ideas: NHTSA APIs + LLMs
+# NHTSA Complaint Defect Detection Pipeline
 
-## Dataset Inventory
+Research code for studying whether large language models can turn NHTSA consumer-complaint narratives into structured defect signals for early safety triage.
 
-### NHTSA Public APIs (no auth required)
+The repository currently supports a 2018 pilot and is designed to scale to additional official NHTSA complaint and recall flat files. It is a research prototype: outputs should be audited before being treated as safety or regulatory conclusions.
 
-| API | Endpoint | Data | Time Range |
-|-----|----------|------|------------|
-| **vPIC** | `vpic.nhtsa.dot.gov/api` | VIN decode, vehicle specs, ADAS/ADS tech presence, manufacturer data | 1981+ |
-| **Crash/FARS** | `crashviewer.nhtsa.dot.gov/CrashAPI` | Fatal crashes, person/vehicle/weather/drug/distraction data | 2010+ |
-| **NCAP** | `api.nhtsa.gov/safetyratings` | Crash test star ratings, crash avoidance test results | Varies |
-| **ODI Recalls** | `api.nhtsa.gov/recalls` | Safety recalls, defect investigations | 1966+ |
-| **Complaints** | `api.nhtsa.gov/complaints` | Consumer complaints with free-text narratives | 1995+ |
-| **SGO 2021-01** | `nhtsa.gov/ODI/ADS/` | Autonomous vehicle incident reports with narrative descriptions | 2022+ |
+## What the pipeline does
 
-### Downloadable Datasets (bulk CSV/ZIP)
+1. Downloads official NHTSA complaint and recall ZIP archives.
+2. Parses the tab-delimited flat files and standardizes dates, identifiers, and common fields.
+3. Exports complaint or recall data to Parquet for repeatable downstream processing.
+4. Creates a stratified CSV sample for manual gold-label annotation.
+5. Sends complaint narratives to an OpenAI-compatible LLM endpoint and validates structured defect annotations.
+6. Embeds and clusters defect signals, then measures their temporal intensity.
+7. Compares clusters with recall records to identify recall-gap candidates and detection lag.
 
-- **Complaints** — 36-78 MB per 5-year block, free-text narrative fields
-- **Recalls** — RCL (Recall Communications), FLAT_RCL (annual/quarterly reports)
-- **TSBS** — Technical Service Bulletins (manufacturer repair guidance)
-- **Crash test databases** — Engineering signal data (CTD API)
+The main research unit is intended to be make × model × model year × component × month. Narrative clusters are an interpretability layer, not proof that a defect exists or that a recall was missed.
 
----
+## Repository layout
 
-## Research Paper Ideas (ranked by novelty × feasibility)
+```text
+nhtsa_pipeline/                 Pipeline package and CLI
+  data.py                       NHTSA download, parsing, and Parquet utilities
+  schema.py                     Defect annotation schema and extraction prompts
+  extract.py                    OpenAI-compatible LLM extraction and checkpointing
+  cluster.py                    Embeddings, clustering, temporal analysis, plots
+  gap_analysis.py               Recall matching and gap-candidate analysis
+  cli.py                        Command-line entry point
+tests/                          Parser and sampling tests
+outputs/                        Annotation rubric and research notes
+paper.md                       Draft manuscript; reported results are unverified
+pyproject.toml                  uv/project configuration
+```
 
-### 1. "Mining Consumer Complaints for Early Defect Detection: A Large Language Model Approach"
+Downloaded data and generated results are intentionally not checked into the repository. Keep them under local `data/` and `results/` directories.
 
-**Core idea:** Use LLMs to extract structured defect signals from NHTSA's 30+ years of free-text consumer complaints (1995+), then analyze temporal patterns to identify defects that were *not* caught by NHTSA's existing recall process.
+## Setup with uv
 
-**Data sources:**
-- Complaints DB (free-text narratives, 1995-2026, ~400MB of text)
-- ODI Recalls (to compare detected vs. recalled defects)
-- vPIC (vehicle specs to correlate defect patterns with model/year)
+Install [uv](https://docs.astral.sh/uv/) if needed, then run from the repository root:
 
-**Methodology:**
-1. **Structured extraction** — LLMs extract: defect category, severity, symptoms, affected subsystem, mileage range, recurrence pattern
-2. **Temporal clustering** — group complaint narratives by semantic similarity using embeddings; detect spikes in specific defect clusters
-3. **Gap analysis** — compare LLM-detected defect clusters against NHTSA's formal recall timeline; identify "missed" defects (clusters that spiked but never triggered a recall)
-4. **Validation** — cross-reference with TSBS (Technical Service Bulletins) and warranty data proxies
+```bash
+uv sync --extra dev
+```
 
-**Novelty:**
-- First systematic LLM analysis of all 30+ years of NHTSA complaints
-- Identifies *recalls that should have happened* (false negatives in NHTSA's own process)
-- Quantifies detection lag: time between first complaint cluster and formal recall
+This creates or updates the project environment and lockfile. Run tests with:
 
-**Contributions:**
-- Framework for automated defect signal detection from unstructured consumer reports
-- Empirical analysis of NHTSA recall process gaps
-- Open dataset of LLM-extracted defect annotations from NHTSA complaints
+```bash
+uv run pytest
+```
 
-**Feasibility:** High — all data is public, no API rate limits on bulk downloads, LLM extraction is straightforward
+The CLI can be invoked either as a module or through the installed console script:
 
----
+```bash
+uv run python -m nhtsa_pipeline.cli --help
+uv run nhtsa-pipeline --help
+```
 
-### 2. "ADAS Technology Adoption vs. Real-World Safety: A Multi-Source Analysis Using NHTSA Data and LLMs"
+## Quick start: 2018 pilot
 
-**Core idea:** Correlate the presence of specific ADAS features (from vPIC) with actual crash outcomes (from FARS/NCAP) to quantify the real-world safety impact of individual ADAS technologies.
+### 1. Download complaint and recall data
 
-**Data sources:**
-- vPIC — ADAS/ADS tech presence by make/model/year (ACC, FCW, LDW, LKA, AEB, etc., for MY 2017+)
-- NCAP — crash avoidance test scores for the same vehicles
-- FARS — fatal crash data (person, vehicle, safety equipment, weather, distraction datasets)
-- Complaints — consumer-reported ADAS failures
+The 2018 pilot uses the official 2015–2019 complaint block and post-2010 recalls:
 
-**Methodology:**
-1. Build a vehicle-level dataset: make/model/year × ADAS features (binary) × NCAP scores × crash involvement
-2. Use LLMs to extract ADAS-related complaints and classify failure modes (false positive, false negative, driver confusion, system override)
-3. Statistical analysis: control for vehicle weight, age, driver demographics to estimate causal impact of each ADAS feature on crash fatality rate
-4. LLM-based narrative analysis of FARS "distracted driving" and "safety equipment" fields to detect ADAS-related crash patterns
+```bash
+uv run nhtsa-pipeline download \
+  --data-dir data/ \
+  --dataset complaints \
+  --year-range 2015-2019
 
-**Novelty:**
-- First study combining manufacturer-reported ADAS presence (vPIC) with actual fatal crash outcomes (FARS) at scale
-- LLM analysis of NHTSA complaint narratives to identify ADAS failure modes
-- Addresses the gap between NCAP lab test results and real-world performance
+uv run nhtsa-pipeline download \
+  --data-dir data/ \
+  --dataset recalls \
+  --recall-range post-2010
+```
 
-**Contributions:**
-- Empirical quantification of real-world ADAS safety impact
-- Taxonomy of ADAS failure modes from consumer reports
-- Evidence for/against current NCAP testing methodology
+### 2. Preprocess the flat files
 
-**Feasibility:** Medium — requires joining multiple datasets, statistical controls needed
+```bash
+uv run nhtsa-pipeline preprocess \
+  --data-dir data/ \
+  --dataset complaints \
+  --year-ranges 2015-2019 \
+  --received-year 2018 \
+  --output data/complaints_2018.parquet
 
----
+uv run nhtsa-pipeline preprocess \
+  --data-dir data/ \
+  --dataset recalls \
+  --recall-range post-2010 \
+  --output data/recalls_post_2010.parquet
+```
 
-### 3. "Automated Analysis of Autonomous Vehicle Incident Reports: LLM-Driven Classification of SGO 2021-01 ADS Incidents"
+Complaint rows retain the official `CMPLID` and `ODINO` identifiers. Standardized columns include `Complaint ID`, `ODI Number`, `Make`, `Model`, `Model Year`, `Date Received`, `Component`, and `Narrative`.
 
-**Core idea:** Apply LLMs to systematically classify and analyze NHTSA's Standing General Order 2021-01 ADS incident reports, extracting structured causal factors, contributing conditions, and safety implications from unstructured narrative descriptions.
+### 3. Create a manual annotation sample
 
-**Data sources:**
-- SGO 2021-01 incident reports (monthly CSV releases with free-text narratives)
-- vPIC (vehicle specs for involved vehicles)
-- FARS (cross-reference with fatal crashes)
+```bash
+uv run nhtsa-pipeline sample \
+  --input data/complaints_2018.parquet \
+  --output data/gold_sample_2018.csv \
+  --n 500
+```
 
-**Methodology:**
-1. LLM classification of incident types: sensor failure, planning error, prediction error, system takeover failure, infrastructure-related, weather-related, other
-2. Temporal trend analysis: track incident types over time (2022-present)
-3. Cross-reference ADS incidents with ADAS incidents to compare failure mode distributions
-4. LLM-based extraction of contributing factors (road conditions, weather, human intervention, system version)
+The sample over-represents records with crash, fire, injury, or death indicators and common components. The generated `.manifest.json` records the sampling settings. Complete the blank `gold_*` columns using [the annotation rubric](outputs/gold_label_annotation_rubric.md).
 
-**Novelty:**
-- First systematic analysis of all NHTSA ADS incident reports
-- Direct comparison of ADAS vs. ADS failure modes
-- Temporal tracking of ADS safety as the technology matures
+### 4. Extract LLM annotations
 
-**Contributions:**
-- Structured taxonomy of ADS incident types from unstructured reports
-- Evidence-based assessment of ADS safety trajectory
-- Framework for ongoing LLM monitoring of ADS incident data
+`extract` expects an OpenAI-compatible `/models` and `/chat/completions` endpoint. By default it targets LM Studio at `http://localhost:1234/v1`.
 
-**Feasibility:** High — data is small (CSV), narratives are well-structured, monthly updates provide natural evaluation timeline
+```bash
+uv run nhtsa-pipeline extract \
+  --input data/complaints_2018.parquet \
+  --output data/annotations_2018.parquet \
+  --base-url http://localhost:1234/v1 \
+  --model qwen/qwen3.6-35b-a3b \
+  --batch-size 1000
+```
 
----
+Extraction is checkpointed in the output Parquet file, so rerunning the command resumes from previously processed complaint IDs. The command also writes an extraction report beside the output file.
 
-### 4. "From Narrative to Signal: LLM-Based Recall Prediction Using NHTSA Consumer Complaints"
+### 5. Cluster defect signals
 
-**Core idea:** Build a predictive model that uses LLM-extracted features from consumer complaints to predict which vehicles will receive safety recalls, with lead time analysis.
+```bash
+uv run nhtsa-pipeline cluster \
+  --input data/annotations_2018.parquet \
+  --output data/clusters_2018 \
+  --min-size 50 \
+  --embedding-model all-MiniLM-L6-v2 \
+  --visualize
+```
 
-**Data sources:**
-- Complaints DB (free-text narratives, structured fields)
-- ODI Recalls (recall announcements with dates)
-- vPIC (vehicle specifications)
+This writes JSON cluster metadata, tabular cluster statistics in Parquet, and—when requested—a PNG distribution plot. The `--output` value is a base path; the implementation adds `.json` and `.parquet`.
 
-**Methodology:**
-1. LLM feature extraction from complaints: defect severity (1-5), safety criticality, recurrence pattern, affected population estimate
-2. Time-series analysis: build complaint intensity features per vehicle model over time
-3. Train a recall prediction model: predict whether a vehicle model will receive a recall in the next 6-12 months
-4. Analyze which complaint features are most predictive of recalls
-5. Identify "silent" complaint clusters — high-intensity complaints that never led to recalls
+### 6. Analyze recall-gap candidates
 
-**Novelty:**
-- First predictive model for safety recalls using NHTSA complaint data
-- LLM-based severity/criticality extraction from unstructured complaints
-- Quantifies the "recall detection gap" — complaints that should have triggered recalls
+```bash
+uv run nhtsa-pipeline gaps \
+  --clusters data/clusters_2018.json \
+  --recalls data/recalls_post_2010.parquet \
+  --output results/gaps_2018.json \
+  --visualize
+```
 
-**Contributions:**
-- Predictive framework for consumer safety advocacy
-- Evidence-based analysis of NHTSA recall decision-making
-- Open tool for real-time recall risk monitoring
+Treat unmatched clusters as candidates for review. They are not evidence of a missed recall without additional validation such as investigation records, technical service bulletins, manufacturer communications, or expert review.
 
-**Feasibility:** Medium — requires careful temporal splitting to avoid data leakage, needs domain expertise for validation
+## Useful commands
 
----
+```bash
+# Show which standard outputs exist
+uv run nhtsa-pipeline status --output-dir results/
 
-### 5. "Crash Reconstruction Assistant: LLM-Powered Analysis of NHTSA Crash Data for Safety Research"
+# Render a cluster visualization from an existing JSON file
+uv run nhtsa-pipeline visualize \
+  --clusters data/clusters_2018.json \
+  --output results/clusters_2018.png
+```
 
-**Core idea:** Build an LLM-powered research assistant that combines multiple NHTSA crash datasets (FARS, NCAP, vPIC, complaints) to generate comprehensive crash narratives and safety recommendations.
+For command-specific options, run `uv run nhtsa-pipeline <command> --help`.
 
-**Data sources:**
-- FARS (fatal crash data, multiple datasets)
-- NCAP (crash test ratings for involved vehicles)
-- vPIC (vehicle specs for involved vehicles)
-- Complaints (prior complaints for involved vehicles)
+## Data sources
 
-**Methodology:**
-1. LLM-based crash narrative generation: combine structured crash data with vehicle specs and prior complaints to generate detailed crash analysis reports
-2. LLM-based safety recommendation extraction: analyze crash patterns and generate targeted safety recommendations
-3. Benchmark LLM-generated analyses against NHTSA's own crash investigation reports
-4. Evaluate LLM accuracy in identifying contributing factors, crash dynamics, and preventability
+The downloader uses NHTSA’s official ODI flat files:
 
-**Novelty:**
-- First multi-source NHTSA crash analysis system powered by LLMs
-- Combines engineering data (NCAP crash tests) with real-world outcomes (FARS)
-- Generates actionable safety recommendations from raw crash data
+- Complaints: `https://static.nhtsa.gov/odi/ffdd/cmpl/`
+- Recalls: `https://static.nhtsa.gov/odi/ffdd/rcl/`
 
-**Contributions:**
-- Open-source crash analysis pipeline
-- Benchmark for LLM-based safety analysis
-- Tool for accelerated safety research
+The repository does not redistribute downloaded complaint narratives or recall records. Check NHTSA’s terms and the applicable data documentation before publishing derived data.
 
-**Feasibility:** Medium-High — requires careful handling of sensitive crash data, but all sources are public
+## Research status and limitations
 
----
+- This is an experimental research pipeline, not a production safety-monitoring system.
+- Complaint narratives are self-reported, noisy, and incomplete.
+- LLM annotations require human evaluation; confidence scores are model outputs, not calibrated probabilities.
+- The gold-label sample is intentionally stratified for triage evaluation and should not be used as a population estimate without weighting.
+- Clustering is currently based on sentence-transformer embeddings and hierarchical clustering; large-scale runs may require more scalable aggregation or clustering methods.
+- `paper.md` contains a draft framing and illustrative result values. Do not cite its numerical results as empirical findings until the experiments are run and documented.
 
-## Recommended Paper (Best Balance)
-
-**Paper 1: "Mining Consumer Complaints for Early Defect Detection"**
-
-**Why this one:**
-- Highest novelty: 30+ years of complaints have never been systematically analyzed with LLMs
-- Highest feasibility: bulk downloads available, no auth, no rate limits
-- Strong impact: identifies systemic gaps in NHTSA's recall process
-- Clean evaluation: compare LLM detections against known recalls (ground truth available)
-- Extensible: monthly complaint updates provide ongoing evaluation opportunity
-- Fits your background: ADAS/vehicle safety domain expertise is directly relevant
-
-**Paper structure:**
-1. Introduction: NHTSA's complaint system, limitations of current analysis methods
-2. Related work: defect detection, text mining in safety domains, LLMs for regulatory analysis
-3. Data: NHTSA complaints, recalls, vPIC — dataset statistics, preprocessing
-4. Method: LLM extraction pipeline, temporal clustering, gap analysis framework
-5. Results: defect detection accuracy, temporal patterns, identified recall gaps
-6. Discussion: implications for NHTSA, limitations, future work
-7. Conclusion
-
-**Timeline:** ~3-4 months for data collection, LLM processing, analysis, and writing
+See [the literature survey](outputs/north_star_literature_survey.md) for the recommended research question, baselines, and definitions of “recall-gap candidate.”

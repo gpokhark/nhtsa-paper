@@ -93,7 +93,7 @@ def load_recalls(recalls_path: str | Path) -> pd.DataFrame:
     - Manufacture Date Range
 
     Args:
-        recalls_path: Path to recalls CSV/JSON
+        recalls_path: Path to recalls CSV, JSON, or Parquet
 
     Returns:
         DataFrame of recalls
@@ -102,6 +102,8 @@ def load_recalls(recalls_path: str | Path) -> pd.DataFrame:
 
     if recalls_path.suffix == ".json":
         recalls = pd.read_json(recalls_path)
+    elif recalls_path.suffix == ".parquet":
+        recalls = pd.read_parquet(recalls_path)
     else:
         recalls = pd.read_csv(recalls_path)
 
